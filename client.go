@@ -165,7 +165,7 @@ func runPull(args []string) error {
 	concurrency := fs_.Int("concurrency", 64, "number of parallel chunk workers")
 	chunkSizeStr := fs_.String("chunk", "4M", "chunk size (e.g. 1M, 4M, 16M)")
 	retries := fs_.Int("retries", 5, "max retries per chunk")
-	timeout := fs_.Duration("chunk-timeout", 30*time.Second, "per-chunk HTTP timeout")
+	timeout := fs_.Duration("chunk-timeout", 5*time.Minute, "per-chunk HTTP timeout (set high; hedging handles slow chunks instead)")
 	hedgeAfter := fs_.Duration("hedge-after", 3*time.Second, "during tail phase, re-issue any in-flight chunk older than this; 0 disables hedging")
 	if err := fs_.Parse(args); err != nil {
 		return err
@@ -409,7 +409,12 @@ func runPull(args []string) error {
 	// workers), re-inject in-flight chunks whose last attempt started >
 	// hedgeAfter ago, capped per chunk. Whichever worker finishes first
 	// wins via states.LoadAndDelete; losers discard their buffer.
-	const maxSpeculationsPerChunk = 8
+	// Each chunk can be re-issued at most this many times beyond the
+	// original. Set low because on bandwidth-limited links the wasted bytes
+	// from extra speculations directly cut into useful throughput — 1 backup
+	// covers the common "stuck on bad connection" case without paying for
+	// many parallel copies.
+	const maxSpeculationsPerChunk = 2
 	stopWatchdog := make(chan struct{})
 	var watchdogDone sync.WaitGroup
 	if *hedgeAfter > 0 {
