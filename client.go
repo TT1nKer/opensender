@@ -28,6 +28,21 @@ type chunkTask struct {
 	Attempt int
 }
 
+func chunkKey(t chunkTask) string {
+	return fmt.Sprintf("%s\x00%d", t.Path, t.Idx)
+}
+
+// chunkState is the shared, per-chunk record consulted by all workers (and the
+// hedging watchdog) handling that chunk. It lives in a sync.Map; the first
+// worker to call LoadAndDelete(key) "wins" and commits its bytes — all other
+// workers that finish later discard theirs.
+type chunkState struct {
+	task          chunkTask
+	mu            sync.Mutex // guards lastInjection + specCount
+	lastInjection time.Time
+	specCount     int
+}
+
 type Manifest struct {
 	Version   int              `json:"version"`
 	ChunkSize int64            `json:"chunk_size"`
@@ -150,7 +165,8 @@ func runPull(args []string) error {
 	concurrency := fs_.Int("concurrency", 64, "number of parallel chunk workers")
 	chunkSizeStr := fs_.String("chunk", "4M", "chunk size (e.g. 1M, 4M, 16M)")
 	retries := fs_.Int("retries", 5, "max retries per chunk")
-	timeout := fs_.Duration("chunk-timeout", 5*time.Minute, "per-chunk HTTP timeout")
+	timeout := fs_.Duration("chunk-timeout", 30*time.Second, "per-chunk HTTP timeout")
+	hedgeAfter := fs_.Duration("hedge-after", 3*time.Second, "during tail phase, re-issue any in-flight chunk older than this; 0 disables hedging")
 	if err := fs_.Parse(args); err != nil {
 		return err
 	}
@@ -294,16 +310,31 @@ func runPull(args []string) error {
 		return nil
 	}
 
-	// queue capacity == len(tasks): always sufficient because the number of
-	// in-flight items (channel + workers) never exceeds the original count.
-	queue := make(chan chunkTask, len(tasks))
+	// Hedging: each chunk has a shared chunkState in `states`. Workers read
+	// (states.Load) on pickup and write-claim (states.LoadAndDelete) on
+	// completion — exactly one finishing worker per chunk commits bytes.
+	// Queue oversized to absorb speculative re-injections from the watchdog.
+	states := &sync.Map{}
+	now := time.Now()
+	for _, t := range tasks {
+		s := &chunkState{task: t, lastInjection: now}
+		states.Store(chunkKey(t), s)
+	}
+	queueCap := len(tasks) + *concurrency*4
+	queue := make(chan chunkTask, queueCap)
 	for _, t := range tasks {
 		queue <- t
 	}
+	// queueDone is closed when all chunks are finalized (success or permanent
+	// fail). Workers and watchdog use it to terminate without panicking on a
+	// closed `queue`.
+	queueDone := make(chan struct{})
+	var queueDoneOnce sync.Once
 
 	var transferred int64 = doneBytes
 	var failedChunks int64
-	var pending int64 = int64(len(tasks))
+	var doneCount int64
+	totalChunks := int64(len(tasks))
 	startTime := time.Now()
 
 	// progress reporter
@@ -368,50 +399,131 @@ func runPull(args []string) error {
 		}
 	}()
 
-	// 5. workers
+	// finalize is idempotent — multiple workers may race to call it when the
+	// last chunk completes; only the first close has any effect.
 	finalize := func() {
-		// called when pending hits 0, exactly once
-		close(queue)
+		queueDoneOnce.Do(func() { close(queueDone) })
 	}
+
+	// Hedging watchdog: during the tail phase (queue empty, many idle
+	// workers), re-inject in-flight chunks whose last attempt started >
+	// hedgeAfter ago, capped per chunk. Whichever worker finishes first
+	// wins via states.LoadAndDelete; losers discard their buffer.
+	const maxSpeculationsPerChunk = 8
+	stopWatchdog := make(chan struct{})
+	var watchdogDone sync.WaitGroup
+	if *hedgeAfter > 0 {
+		watchdogDone.Add(1)
+		go func() {
+			defer watchdogDone.Done()
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopWatchdog:
+					return
+				case <-queueDone:
+					return
+				case <-ticker.C:
+					// Only hedge in tail phase: when most workers should be idle.
+					remaining := totalChunks - atomic.LoadInt64(&doneCount)
+					if remaining <= 0 || remaining > int64(*concurrency)/4 {
+						continue
+					}
+					nowT := time.Now()
+					states.Range(func(_, val interface{}) bool {
+						s := val.(*chunkState)
+						s.mu.Lock()
+						should := nowT.Sub(s.lastInjection) > *hedgeAfter && s.specCount < maxSpeculationsPerChunk
+						if should {
+							s.lastInjection = nowT
+							s.specCount++
+						}
+						task := s.task
+						s.mu.Unlock()
+						if should {
+							select {
+							case queue <- task:
+							default:
+								// queue full; next tick will retry
+							}
+						}
+						return true
+					})
+				}
+			}
+		}()
+	}
+
 	var wg sync.WaitGroup
 	for w := 0; w < *concurrency; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for task := range queue {
+			for {
+				var task chunkTask
+				select {
+				case task = <-queue:
+				case <-queueDone:
+					return
+				}
+				key := chunkKey(task)
+				// Skip if another worker already won this chunk.
+				if _, stillNeeded := states.Load(key); !stillNeeded {
+					continue
+				}
 				buf, err := fetchChunk(httpClient, baseURL, *token, task)
 				if err != nil {
+					// Someone else may have already won while we were fetching.
+					if _, stillNeeded := states.Load(key); !stillNeeded {
+						continue
+					}
 					task.Attempt++
 					if task.Attempt >= *retries {
-						atomic.AddInt64(&failedChunks, 1)
-						fmt.Fprintf(os.Stderr, "\nchunk %s#%d failed after %d retries: %v\n",
-							task.Path, task.Idx, *retries, err)
-						if atomic.AddInt64(&pending, -1) == 0 {
-							finalize()
+						// Take ownership of permanent failure — only if not
+						// already won by a speculator that finishes later.
+						if _, claimed := states.LoadAndDelete(key); claimed {
+							atomic.AddInt64(&failedChunks, 1)
+							fmt.Fprintf(os.Stderr, "\nchunk %s#%d failed after %d retries: %v\n",
+								task.Path, task.Idx, *retries, err)
+							if atomic.AddInt64(&doneCount, 1) == totalChunks {
+								finalize()
+							}
 						}
 						continue
 					}
 					time.Sleep(time.Duration(task.Attempt) * 500 * time.Millisecond)
-					queue <- task
-					continue
-				}
-				if err := writeChunk(buf, task, getHandle); err != nil {
-					fmt.Fprintf(os.Stderr, "\nchunk %s#%d write failed: %v\n", task.Path, task.Idx, err)
-					atomic.AddInt64(&failedChunks, 1)
-					if atomic.AddInt64(&pending, -1) == 0 {
-						finalize()
+					select {
+					case queue <- task:
+					case <-queueDone:
+						return
+					default:
+						// queue full; watchdog or other re-injections will
+						// retry — don't block this worker.
 					}
 					continue
 				}
-				manifest.markComplete(task.Path, task.Idx)
-				atomic.AddInt64(&transferred, task.Length)
-				if atomic.AddInt64(&pending, -1) == 0 {
+				// Successful fetch: try to claim. LoadAndDelete returns true
+				// for exactly one worker per chunk.
+				if _, won := states.LoadAndDelete(key); !won {
+					continue // lost the race; discard buf
+				}
+				if werr := writeChunk(buf, task, getHandle); werr != nil {
+					fmt.Fprintf(os.Stderr, "\nchunk %s#%d write failed: %v\n", task.Path, task.Idx, werr)
+					atomic.AddInt64(&failedChunks, 1)
+				} else {
+					manifest.markComplete(task.Path, task.Idx)
+					atomic.AddInt64(&transferred, task.Length)
+				}
+				if atomic.AddInt64(&doneCount, 1) == totalChunks {
 					finalize()
 				}
 			}
 		}()
 	}
 	wg.Wait()
+	close(stopWatchdog)
+	watchdogDone.Wait()
 
 	close(stopFlush)
 	flushDone.Wait()
