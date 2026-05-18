@@ -1,0 +1,12 @@
+# build artifacts
+/opensender
+/opensender.exe
+/opensender-*
+
+# client-side resume state
+.opensender-manifest.json
+.opensender-manifest.json.tmp
+
+# editor/OS noise
+*.swp
+.DS_Store
