@@ -27,6 +27,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
+	case "init":
+		if err := runInit(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -40,17 +45,16 @@ func usage() {
 	fmt.Fprint(os.Stderr, `opensender — high-concurrency file transfer over high-latency links
 
 Usage:
+  opensender init                                    # write ~/.opensender.json
+  opensender pull --remote PATH                      # daily use, after init
+  opensender pull --url URL --remote PATH --local DIR --token TOKEN
+                  [--concurrency N] [--chunk SIZE]   # full form (no config)
   opensender serve --root DIR --token TOKEN [--listen ADDR]
-  opensender pull  --url URL --remote PATH --local DIR --token TOKEN
-                   [--concurrency N] [--chunk SIZE] [--retries N]
 
-Examples:
-  # Server (Linux side)
-  opensender serve --root /data/models --token s3cret --listen :8080
-
-  # Client (Windows side)
-  opensender.exe pull --url http://100.x.x.x:8080 \
-      --remote checkpoints/ --local D:\models\ \
-      --concurrency 128 --chunk 4M --token s3cret
+Notes:
+  - Built-in defaults (concurrency=1024, chunk=256K) are tuned for the
+    target link from real-world benchmarks. Override per-run with flags.
+  - 'init' creates ~/.opensender.json so url/token/local don't need to be
+    typed every time. CLI flags always override config.
 `)
 }

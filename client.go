@@ -158,16 +158,38 @@ func escapePath(p string) string {
 }
 
 func runPull(args []string) error {
+	// Load config FIRST so its values can serve as flag defaults; CLI flags
+	// then override config. This lets `opensender init` capture url/token/
+	// local once and have the user type only `opensender pull --remote X`
+	// for daily transfers.
+	cfg := loadConfig()
+	cfgChunk := cfg.Chunk
+	if cfgChunk == "" {
+		cfgChunk = "256K"
+	}
+	cfgConc := cfg.Concurrency
+	if cfgConc == 0 {
+		cfgConc = 1024
+	}
+	cfgHedge := 3 * time.Second
+	if cfg.HedgeAfter != "" {
+		if d, err := time.ParseDuration(cfg.HedgeAfter); err == nil {
+			cfgHedge = d
+		}
+	}
+
 	fs_ := flag.NewFlagSet("pull", flag.ExitOnError)
-	urlFlag := fs_.String("url", "", "server base URL (e.g. http://100.x.x.x:8080)")
+	urlFlag := fs_.String("url", cfg.URL, "server base URL (e.g. http://100.x.x.x:8080)")
 	remote := fs_.String("remote", "", "remote path (file or dir, relative to server root); empty = whole root")
-	localDir := fs_.String("local", "", "local destination directory")
-	token := fs_.String("token", "", "bearer token")
-	concurrency := fs_.Int("concurrency", 64, "number of parallel chunk workers")
-	chunkSizeStr := fs_.String("chunk", "4M", "chunk size (e.g. 1M, 4M, 16M)")
+	localDir := fs_.String("local", cfg.Local, "local destination directory")
+	token := fs_.String("token", cfg.Token, "bearer token")
+	// Defaults come from real-world benchmarks on the target link
+	// (Tailscale cross-border, single-stream pathological). See README.
+	concurrency := fs_.Int("concurrency", cfgConc, "number of parallel chunk workers")
+	chunkSizeStr := fs_.String("chunk", cfgChunk, "chunk size (e.g. 64K, 256K, 1M)")
 	retries := fs_.Int("retries", 5, "max retries per chunk")
 	timeout := fs_.Duration("chunk-timeout", 5*time.Minute, "per-chunk HTTP timeout (set high; hedging handles slow chunks instead)")
-	hedgeAfter := fs_.Duration("hedge-after", 3*time.Second, "during tail phase, re-issue any in-flight chunk older than this; 0 disables hedging")
+	hedgeAfter := fs_.Duration("hedge-after", cfgHedge, "during tail phase, re-issue any in-flight chunk older than this; 0 disables hedging")
 	if err := fs_.Parse(args); err != nil {
 		return err
 	}
