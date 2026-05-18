@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
@@ -327,9 +328,13 @@ func runPull(args []string) error {
 	}
 	// queueDone is closed when all chunks are finalized (success or permanent
 	// fail). Workers and watchdog use it to terminate without panicking on a
-	// closed `queue`.
+	// closed `queue`. The associated context cancels in-flight HTTP requests
+	// so workers don't have to wait out --chunk-timeout on stalled connections
+	// after the overall transfer is already done.
 	queueDone := make(chan struct{})
 	var queueDoneOnce sync.Once
+	fetchCtx, cancelFetches := context.WithCancel(context.Background())
+	defer cancelFetches()
 
 	var transferred int64 = doneBytes
 	var failedChunks int64
@@ -400,9 +405,14 @@ func runPull(args []string) error {
 	}()
 
 	// finalize is idempotent — multiple workers may race to call it when the
-	// last chunk completes; only the first close has any effect.
+	// last chunk completes; only the first close has any effect. Canceling
+	// fetchCtx kicks any worker still blocked in fetchChunk (e.g. a hedging
+	// speculator on a stalled connection) out of its HTTP read immediately.
 	finalize := func() {
-		queueDoneOnce.Do(func() { close(queueDone) })
+		queueDoneOnce.Do(func() {
+			close(queueDone)
+			cancelFetches()
+		})
 	}
 
 	// Hedging watchdog: during the tail phase (queue empty, many idle
@@ -477,8 +487,13 @@ func runPull(args []string) error {
 				if _, stillNeeded := states.Load(key); !stillNeeded {
 					continue
 				}
-				buf, err := fetchChunk(httpClient, baseURL, *token, task)
+				buf, err := fetchChunk(fetchCtx, httpClient, baseURL, *token, task)
 				if err != nil {
+					// If the overall pull has finished, our fetch was canceled
+					// on purpose — just exit, don't retry, don't count as fail.
+					if errors.Is(err, context.Canceled) || fetchCtx.Err() != nil {
+						return
+					}
 					// Someone else may have already won while we were fetching.
 					if _, stillNeeded := states.Load(key); !stillNeeded {
 						continue
@@ -549,9 +564,13 @@ func runPull(args []string) error {
 // fetchChunk performs the HTTP Range GET, validates SHA256, and returns the
 // bytes. It does NOT write to disk — the caller decides whether to commit the
 // bytes (used by hedging: a worker that loses the claim race discards the buf).
-func fetchChunk(client *http.Client, baseURL, token string, task chunkTask) ([]byte, error) {
+//
+// The context is canceled by the caller when the overall pull has finished
+// (all chunks claimed); this aborts in-flight HTTP reads that are otherwise
+// blocked on long --chunk-timeout waiting for stalled connections.
+func fetchChunk(ctx context.Context, client *http.Client, baseURL, token string, task chunkTask) ([]byte, error) {
 	u := fmt.Sprintf("%s/file/%s", baseURL, escapePath(task.Path))
-	req, err := http.NewRequest("GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
