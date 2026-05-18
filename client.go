@@ -379,7 +379,7 @@ func runPull(args []string) error {
 		go func() {
 			defer wg.Done()
 			for task := range queue {
-				err := downloadChunk(httpClient, baseURL, *token, task, getHandle)
+				buf, err := fetchChunk(httpClient, baseURL, *token, task)
 				if err != nil {
 					task.Attempt++
 					if task.Attempt >= *retries {
@@ -393,6 +393,14 @@ func runPull(args []string) error {
 					}
 					time.Sleep(time.Duration(task.Attempt) * 500 * time.Millisecond)
 					queue <- task
+					continue
+				}
+				if err := writeChunk(buf, task, getHandle); err != nil {
+					fmt.Fprintf(os.Stderr, "\nchunk %s#%d write failed: %v\n", task.Path, task.Idx, err)
+					atomic.AddInt64(&failedChunks, 1)
+					if atomic.AddInt64(&pending, -1) == 0 {
+						finalize()
+					}
 					continue
 				}
 				manifest.markComplete(task.Path, task.Idx)
@@ -421,36 +429,44 @@ func runPull(args []string) error {
 	return nil
 }
 
-func downloadChunk(client *http.Client, baseURL, token string, task chunkTask, getHandle func(string) (*os.File, error)) error {
+// fetchChunk performs the HTTP Range GET, validates SHA256, and returns the
+// bytes. It does NOT write to disk — the caller decides whether to commit the
+// bytes (used by hedging: a worker that loses the claim race discards the buf).
+func fetchChunk(client *http.Client, baseURL, token string, task chunkTask) ([]byte, error) {
 	u := fmt.Sprintf("%s/file/%s", baseURL, escapePath(task.Path))
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", task.Offset, task.Offset+task.Length-1))
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("expected 206, got %s: %s", resp.Status, body)
+		return nil, fmt.Errorf("expected 206, got %s: %s", resp.Status, body)
 	}
 	expectedSHA := resp.Header.Get("X-Chunk-SHA256")
 	if expectedSHA == "" {
-		return errors.New("server did not return X-Chunk-SHA256")
+		return nil, errors.New("server did not return X-Chunk-SHA256")
 	}
 	buf := make([]byte, task.Length)
 	if _, err := io.ReadFull(resp.Body, buf); err != nil {
-		return fmt.Errorf("read body: %w", err)
+		return nil, fmt.Errorf("read body: %w", err)
 	}
 	sum := sha256.Sum256(buf)
 	got := hex.EncodeToString(sum[:])
 	if got != expectedSHA {
-		return fmt.Errorf("sha256 mismatch (got %s, expected %s)", got, expectedSHA)
+		return nil, fmt.Errorf("sha256 mismatch (got %s, expected %s)", got, expectedSHA)
 	}
+	return buf, nil
+}
+
+// writeChunk commits the bytes to the local file at the chunk's offset.
+func writeChunk(buf []byte, task chunkTask, getHandle func(string) (*os.File, error)) error {
 	f, err := getHandle(task.Path)
 	if err != nil {
 		return err
