@@ -47,6 +47,7 @@ func usage() {
 Usage:
   opensender init                                    # write ~/.opensender.json
   opensender pull --remote PATH                      # daily use, after init
+  opensender pull --remote DIR --include '*.pdf'     # pull matching files
   opensender pull --url URL --remote PATH --local DIR --token TOKEN
                   [--concurrency N] [--chunk SIZE]   # full form (no config)
   opensender serve --root DIR --token TOKEN [--listen ADDR]

@@ -81,11 +81,16 @@ opensender init
 ```sh
 opensender pull --remote checkpoints/sd_xl.safetensors
 opensender pull --remote vae/                              # recursive
+opensender pull --remote "" --include "*.pdf"              # matching files
 opensender pull --remote checkpoints/foo.bin --local E:\elsewhere\
 ```
 
 `--remote` is a path relative to the server's `--root`. Empty means the
 whole root. The client recurses into subdirectories.
+
+Use `--include` to filter the listed files with a glob. The pattern is matched
+against both the remote relative path and the base filename, so `*.pdf` matches
+PDF files anywhere under the selected `--remote` directory.
 
 If interrupted, just rerun the same command — a `.opensender-manifest.json`
 sidecar in `--local` records which chunks finished, and the next run
@@ -110,6 +115,7 @@ opensender pull \
 | `--hedge-after`   | 3s      | Tail-phase re-issue threshold. 0 disables hedging.   |
 | `--chunk-timeout` | 5m      | Per-request timeout.                                 |
 | `--retries`       | 5       | Per-chunk retry budget before permanent failure.     |
+| `--include`       | unset   | Optional glob filter, e.g. `*.pdf`.                  |
 
 Defaults are tuned from real-world benchmarks on the target link. Other
 links may want different values; if so, edit `~/.opensender.json` to make

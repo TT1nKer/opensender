@@ -39,9 +39,11 @@ func chunkKey(t chunkTask) string {
 // workers that finish later discard theirs.
 type chunkState struct {
 	task          chunkTask
-	mu            sync.Mutex // guards lastInjection + specCount
+	mu            sync.Mutex // guards lastInjection, specCount, done, attempts
 	lastInjection time.Time
 	specCount     int
+	done          bool // true if a worker successfully downloaded this chunk
+	attempts      int  // cumulative failure count across all workers and watchdog re-injections
 }
 
 type Manifest struct {
@@ -75,6 +77,11 @@ func loadManifest(path string) (*Manifest, error) {
 func (m *Manifest) markComplete(path string, idx int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, id := range m.Completed[path] {
+		if id == idx {
+			return
+		}
+	}
 	m.Completed[path] = append(m.Completed[path], idx)
 	m.dirty = true
 }
@@ -104,7 +111,19 @@ func (m *Manifest) flush() error {
 		return err
 	}
 	tmp := m.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, m.path); err != nil {
@@ -273,6 +292,7 @@ func runPull(args []string) error {
 	defer func() {
 		fhMu.Lock()
 		for _, f := range fileHandles {
+			f.Sync()
 			f.Close()
 		}
 		fhMu.Unlock()
@@ -305,6 +325,16 @@ func runPull(args []string) error {
 	} else if manifest.ChunkSize != chunkSize {
 		return fmt.Errorf("manifest chunk_size %d differs from --chunk %d; either delete %s or pass --chunk %d",
 			manifest.ChunkSize, chunkSize, manifestPath, manifest.ChunkSize)
+	} else if manifest.BaseURL != baseURL || manifest.Remote != *remote {
+		fmt.Fprintf(os.Stderr, "warning: manifest base_url/remote changed — starting fresh\n")
+		manifest = &Manifest{
+			Version:   1,
+			ChunkSize: chunkSize,
+			BaseURL:   baseURL,
+			Remote:    *remote,
+			Completed: map[string][]int{},
+			path:      manifestPath,
+		}
 	}
 	doneIdx := manifest.buildIndex()
 
@@ -426,6 +456,34 @@ func runPull(args []string) error {
 		}
 	}()
 
+	// periodic file syncer: flushes dirty pages to disk every 2 seconds
+	// so that a crash loses at most a few seconds of work. The final
+	// Sync+Close in the defer ensures everything is durable on completion.
+	stopFileSync := make(chan struct{})
+	var fileSyncDone sync.WaitGroup
+	fileSyncDone.Add(1)
+	go func() {
+		defer fileSyncDone.Done()
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopFileSync:
+				return
+			case <-ticker.C:
+				fhMu.Lock()
+				handles := make([]*os.File, 0, len(fileHandles))
+				for _, f := range fileHandles {
+					handles = append(handles, f)
+				}
+				fhMu.Unlock()
+				for _, f := range handles {
+					f.Sync()
+				}
+			}
+		}
+	}()
+
 	// finalize is idempotent — multiple workers may race to call it when the
 	// last chunk completes; only the first close has any effect. Canceling
 	// fetchCtx kicks any worker still blocked in fetchChunk (e.g. a hedging
@@ -437,23 +495,21 @@ func runPull(args []string) error {
 		})
 	}
 
-	// Hedging watchdog: during the tail phase (queue empty, many idle
-	// workers), re-inject in-flight chunks whose last attempt started >
-	// hedgeAfter ago, capped per chunk. Whichever worker finishes first
-	// wins via states.LoadAndDelete; losers discard their buffer.
-	// Each chunk can be re-issued at most this many times beyond the
-	// original. Set low because on bandwidth-limited links the wasted bytes
-	// from extra speculations directly cut into useful throughput — 1 backup
-	// covers the common "stuck on bad connection" case without paying for
-	// many parallel copies.
-	const maxSpeculationsPerChunk = 2
+	// Hedging watchdog: re-inject in-flight chunks whose last attempt
+	// started > hedgeDelay ago, regardless of transfer phase. Whichever
+	// worker finishes first wins via states.LoadAndDelete.
+	//
+	// Always-on hedging — not just tail phase — prevents slow chunks
+	// from accumulating unbounded delay during the bulk of the transfer.
+	// Progressive speculation caps keep bandwidth waste bounded:
+	// bulk phase → low cap, tail phase → aggressive cap.
 	stopWatchdog := make(chan struct{})
 	var watchdogDone sync.WaitGroup
 	if *hedgeAfter > 0 {
 		watchdogDone.Add(1)
 		go func() {
 			defer watchdogDone.Done()
-			ticker := time.NewTicker(1 * time.Second)
+			ticker := time.NewTicker(500 * time.Millisecond)
 			defer ticker.Stop()
 			for {
 				select {
@@ -462,27 +518,57 @@ func runPull(args []string) error {
 				case <-queueDone:
 					return
 				case <-ticker.C:
-					// Only hedge in tail phase: when most workers should be idle.
 					remaining := totalChunks - atomic.LoadInt64(&doneCount)
-					if remaining <= 0 || remaining > int64(*concurrency)/4 {
+					if remaining <= 0 {
 						continue
+					}
+					// Progressive caps: conservative during bulk, aggressive at tail.
+					var maxSpec int
+					var hedgeDelay time.Duration
+					baseThreshold := int64(*concurrency) / 4
+					switch {
+					case remaining <= 5:
+						maxSpec = 10
+						hedgeDelay = 500 * time.Millisecond
+					case remaining <= 20:
+						maxSpec = 6
+						hedgeDelay = 1 * time.Second
+					case remaining <= baseThreshold:
+						maxSpec = 3
+						hedgeDelay = *hedgeAfter
+						if hedgeDelay < 1*time.Second {
+							hedgeDelay = 1 * time.Second
+						}
+					default:
+						maxSpec = 1
+						hedgeDelay = *hedgeAfter
+						if hedgeDelay < 2*time.Second {
+							hedgeDelay = 2 * time.Second
+						}
 					}
 					nowT := time.Now()
 					states.Range(func(_, val interface{}) bool {
 						s := val.(*chunkState)
 						s.mu.Lock()
-						should := nowT.Sub(s.lastInjection) > *hedgeAfter && s.specCount < maxSpeculationsPerChunk
-						if should {
-							s.lastInjection = nowT
-							s.specCount++
-						}
-						task := s.task
+						should := nowT.Sub(s.lastInjection) > hedgeDelay && s.specCount < maxSpec
 						s.mu.Unlock()
 						if should {
+							s.mu.Lock()
+							if s.specCount >= maxSpec || nowT.Sub(s.lastInjection) <= hedgeDelay {
+								s.mu.Unlock()
+								return true
+							}
+							s.lastInjection = nowT
+							s.specCount++
+							task := s.task
+							task.Attempt = s.attempts
+							s.mu.Unlock()
 							select {
 							case queue <- task:
 							default:
-								// queue full; next tick will retry
+								s.mu.Lock()
+								s.specCount--
+								s.mu.Unlock()
 							}
 						}
 						return true
@@ -505,6 +591,16 @@ func runPull(args []string) error {
 					return
 				}
 				key := chunkKey(task)
+				// Sync cumulative attempts from chunkState so that
+				// watchdog re-injections don't reset the counter.
+				if sRaw, ok := states.Load(key); ok {
+					s := sRaw.(*chunkState)
+					s.mu.Lock()
+					if s.attempts > task.Attempt {
+						task.Attempt = s.attempts
+					}
+					s.mu.Unlock()
+				}
 				// Skip if another worker already won this chunk.
 				if _, stillNeeded := states.Load(key); !stillNeeded {
 					continue
@@ -521,10 +617,43 @@ func runPull(args []string) error {
 						continue
 					}
 					task.Attempt++
+					// Persist cumulative attempt count so the watchdog
+					// can re-inject with the correct count later.
+					if sRaw, ok := states.Load(key); ok {
+						s := sRaw.(*chunkState)
+						s.mu.Lock()
+						if task.Attempt > s.attempts {
+							s.attempts = task.Attempt
+						}
+						s.mu.Unlock()
+					}
 					if task.Attempt >= *retries {
-						// Take ownership of permanent failure — only if not
-						// already won by a speculator that finishes later.
+						// Load chunkState before LoadAndDelete so we
+						// can check whether a speculative worker
+						// already downloaded this chunk successfully.
+						sRaw, _ := states.Load(key)
 						if _, claimed := states.LoadAndDelete(key); claimed {
+							if sRaw != nil {
+								s := sRaw.(*chunkState)
+								s.mu.Lock()
+								wasDone := s.done
+								s.mu.Unlock()
+								if wasDone {
+									// Success path set done before
+									// our LoadAndDelete won.
+									// Re-store and re-queue so a
+									// worker can write the data.
+									states.Store(key, &chunkState{task: task, done: true})
+									task.Attempt = 0
+									select {
+									case queue <- task:
+									case <-queueDone:
+										return
+									case <-time.After(30 * time.Second):
+									}
+									continue
+								}
+							}
 							atomic.AddInt64(&failedChunks, 1)
 							fmt.Fprintf(os.Stderr, "\nchunk %s#%d failed after %d retries: %v\n",
 								task.Path, task.Idx, *retries, err)
@@ -539,14 +668,26 @@ func runPull(args []string) error {
 					case queue <- task:
 					case <-queueDone:
 						return
-					default:
-						// queue full; watchdog or other re-injections will
-						// retry — don't block this worker.
+					case <-time.After(30 * time.Second):
+						// queue stuck full for too long; watchdog may
+						// re-inject with the correct attempt count.
 					}
 					continue
 				}
-				// Successful fetch: try to claim. LoadAndDelete returns true
-				// for exactly one worker per chunk.
+				// Successful fetch: mark the chunk as done under the
+				// chunkState mutex BEFORE LoadAndDelete. This lets
+				// the failure path detect that a successful download
+				// exists, preventing valid data from being discarded
+				// when a hedging speculator finishes after the
+				// original worker exhausts retries.
+				if sRaw, ok := states.Load(key); ok {
+					s := sRaw.(*chunkState)
+					s.mu.Lock()
+					s.done = true
+					s.mu.Unlock()
+				}
+				// Try to claim. LoadAndDelete returns true for
+				// exactly one worker per chunk.
 				if _, won := states.LoadAndDelete(key); !won {
 					continue // lost the race; discard buf
 				}
@@ -566,6 +707,9 @@ func runPull(args []string) error {
 	wg.Wait()
 	close(stopWatchdog)
 	watchdogDone.Wait()
+
+	close(stopFileSync)
+	fileSyncDone.Wait()
 
 	close(stopFlush)
 	flushDone.Wait()
@@ -624,6 +768,9 @@ func fetchChunk(ctx context.Context, client *http.Client, baseURL, token string,
 }
 
 // writeChunk commits the bytes to the local file at the chunk's offset.
+// Durability is handled by a periodic syncer and a final Sync+Close
+// in the defer block — not per-chunk, to avoid io contention at high
+// concurrency.
 func writeChunk(buf []byte, task chunkTask, getHandle func(string) (*os.File, error)) error {
 	f, err := getHandle(task.Path)
 	if err != nil {

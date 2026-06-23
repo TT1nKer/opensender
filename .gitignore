@@ -2,6 +2,7 @@
 /opensender
 /opensender.exe
 /opensender-*
+/.gocache/
 
 # client-side resume state
 .opensender-manifest.json
